@@ -1,0 +1,22 @@
+FROM golang:1.26-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY main.go ./
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/main .
+
+FROM scratch
+
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/main /main
+
+ENV TS_STATE_DIR=/state
+VOLUME ["/state"]
+
+ENTRYPOINT ["/main"]

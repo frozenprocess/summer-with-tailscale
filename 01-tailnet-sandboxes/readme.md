@@ -4,14 +4,16 @@ A tailnet is a foundational component of Tailscale. By default, every user is as
 
 While a single tailnet works well for everyday networking, you often need isolated environments for testing, multi-tenant deployments, or sandboxed AI workloads.
 
-Tailscale allows you to programmatically provision additional, completely isolated tailnets using the Tailscale Console API.
+Tailscale allows you to programmatically provision additional, completely isolated tailnets using the Tailscale API.
 
 ## Manual walkthrough (no scripts, just curl)
 
-This part is a walkthough over each script. Staring with `01-provision-tailnet.sh`, this script creates an additional tailnet to isolate the `probe` and `tool-server` deployments on a sandboxed secure network.
+This part is a walkthrough over the raw API calls, no scripts involved. We'll create an additional tailnet to isolate the `probe` and `tool-server` deployments on a sandboxed secure network.
 
+Before we get started, create an OAuth client in the console and export its credentials as environment variables. Scope the client narrowly to what this walkthrough needs: under **Custom scopes**, grant **Tailnets: Read + Write** and leave everything else unchecked—an OAuth client with blanket admin access is more than this requires.
 
-First, export the credentials as an environment variable.
+![Editing an OAuth client's scopes in the Tailscale console, with the Tailnets scope set to Read and Write](screenshot-oauth-client.png)
+
 ```bash
 export CLIENT_ID=<your OAuth client id>
 export CLIENT_SECRET=<your OAuth client secret>
@@ -37,7 +39,7 @@ curl -sS https://api.tailscale.com/api/v2/organizations/-/tailnets \
   --data '{"displayName": "agent-sandbox"}'
 ```
 
-> **Important**: Save the JSON output returned by this command. It contains the scoped admin credentials for the newly created tailnet.
+> **Important**: Save the JSON output returned by this command. It contains the scoped admin credentials for the newly created tailnet—your org-level `$ACCESS_TOKEN` can't delete it later; only these credentials can.
 
 example API response
 ```json
@@ -56,14 +58,19 @@ curl -sS https://api.tailscale.com/api/v2/organizations/-/tailnets \
 ```
 ### Delete a Tailnet
 
-To delete a tailnet, issue a DELETE request referencing the tailnet ID. Note that credential revocation requires the parent organization token or proper administrative scope:
+To delete a tailnet, issue a DELETE request referencing the tailnet ID. The org-level `$ACCESS_TOKEN` from earlier won't work here—deletion requires a token scoped to that specific tailnet, so exchange the `oauthClient` credentials from its creation response (the same exchange as the very first step, just with that tailnet's own `id`/`secret`) for their own access token first:
 ```bash
+TAILNET_ACCESS_TOKEN=$(curl -sS -X POST "https://api.tailscale.com/api/v2/oauth/token" \
+  -d "client_id=kHN12PmWUw11CNTRL" \
+  -d "client_secret=tskey-client-kHN12PmWUw11CNTRL-e4VB9oXiRq2j1RZSZ4yjp2xN5T3jdteQ" \
+  | jq -r '.access_token')
+
 curl https://api.tailscale.com/api/v2/tailnet/T4nzP1SHT921CNTRL \
   --request DELETE \
-  --header "Authorization: Bearer $TAIL_ACCESS"
+  --header "Authorization: Bearer $TAILNET_ACCESS_TOKEN"
 ```
 
-**Security Note:** If an OAuth client ID or secret is ever compromised, revoke it immediately in the console. Do not simply remove its permissions, as active access tokens remain valid until expiration.
+**Security Note:** If an OAuth client ID or secret is ever compromised, revoke it immediately. Do not simply modify its permissions, as active access tokens may remain valid until expiration.
 
 ## What's next?
 
@@ -73,5 +80,5 @@ Now that you can programmatically provision isolated tailnets, the next module e
 ## References
 
 - [What is a tailnet?](https://tailscale.com/docs/concepts/tailnet)
-- [Addiotnal tailnets](https://tailscale.com/api#tag/organizations)
+- [Additional tailnets](https://tailscale.com/api#tag/organizations)
 - [Trust-credentials](https://tailscale.com/kb/1623/trust-credentials)

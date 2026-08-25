@@ -12,20 +12,22 @@ This repo is a walkthrough-style collection, not a single deployable app. Each t
 
 ## Modules
 
-- [01-tailnet-sandboxes](01-tailnet-sandboxes/readme.md): Manual curl/jq walkthrough for programmatically creating, listing, and deleting isolated tailnets via the Tailscale Console API (OAuth client credentials flow). Includes a screenshot of the OAuth client setup.
-- [02-tailnet-membership](02-tailnet-membership/readme.md): A Go app (`main.go`) using `tsnet` to embed a Tailscale node directly in-process — no system daemon required. Registers on a tailnet, listens with automatic HTTPS via `ListenTLS`, and reverse-proxies traffic to a local backend (e.g. Ollama). Includes a multi-stage `dockerfile` producing a minimal static `scratch`-based image.
+- [01-tailnet-sandboxes](01-tailnet-sandboxes/readme.md): Manual curl/jq walkthrough for programmatically creating, listing, and deleting isolated tailnets via the Tailscale API (OAuth client credentials flow). Includes a screenshot of the OAuth client scope setup.
+- [02-tailnet-membership](02-tailnet-membership/readme.md): A Go app (`main.go`) using `tsnet` to embed a Tailscale node directly in-process — no system daemon required. Registers on a tailnet and serves "Hello from tsnet" over automatic HTTPS via `ListenTLS`. Includes a multi-stage `dockerfile` producing a minimal static `scratch`-based image.
 - [03-declarative-sharing](03-declarative-sharing/readme.md): Explains Declarative Tailnet Sharing (currently waitlisted) — defining cross-tailnet access as code in the policy file via `externalTailnets` and `grants`, scoped by group/tag rather than raw IPs.
-- [04-api-is-the-way](04-api-is-the-way/readme.md): Planned final module tying everything together — provisioning two isolated tailnets, attaching an app to each, and automating cross-app connectivity end to end. Not yet written.
+- [04-api-is-the-way](04-api-is-the-way/readme.md): Ties modules 01-03 together via the API — issuing auth keys and editing the policy file programmatically instead of through the console. Includes `end-to-end.sh`, a runnable script that provisions two tailnets, deploys the module 02 app into each, and declaratively shares them.
 
 ## Key files
 
-- [readme.md](readme.md): Top-level project overview and prerequisites.
+- [readme.md](readme.md): Top-level project overview, prerequisites, and how to invoke `end-to-end.sh`.
 - [.env.example](.env.example): Expected environment variables (`CLIENT_ID`, `CLIENT_SECRET`) for the Tailscale OAuth client used across modules.
-- [02-tailnet-membership/main.go](02-tailnet-membership/main.go): Reference `tsnet` implementation — reverse proxy exposed over Tailscale with automatic TLS.
+- [02-tailnet-membership/main.go](02-tailnet-membership/main.go): Reference `tsnet` implementation — registers on a tailnet and serves a static "Hello from tsnet" response over automatic HTTPS.
 - [02-tailnet-membership/dockerfile](02-tailnet-membership/dockerfile): Multi-stage build producing a static Go binary in a `scratch` image, with CA certs bundled for tsnet's HTTPS calls to Tailscale's control plane.
+- [04-api-is-the-way/end-to-end.sh](04-api-is-the-way/end-to-end.sh): `up`/`status`/`down` script chaining modules 01-03 via the API; state (including per-tailnet OAuth credentials, needed for teardown) is kept in `04-api-is-the-way/.state/` (gitignored).
 
 ## Notes for LLMs working in this repo
 
 - Module numbering encodes reading/build order — each module's readme ends with a "What's next" pointer to the following one.
-- `02-tailnet-membership` is the only module with runnable code today; `01` and `03` are narrative/API walkthroughs; `04` is a stub.
+- `02-tailnet-membership` and `04-api-is-the-way` have runnable code (`main.go`/`dockerfile` and `end-to-end.sh` respectively); `01` and `03` are narrative/API walkthroughs.
+- Deleting a tailnet requires that specific tailnet's own `oauthClient` credentials (returned when it was created), not the org-level `CLIENT_ID`/`CLIENT_SECRET` — this trips people up, see `01-tailnet-sandboxes/readme.md`'s "Delete a Tailnet" section.
 - Tailscale concepts referenced throughout: tailnet, `tsnet`, auth keys vs. OAuth client credentials, policy files (ACLs/grants/groups), Declarative Tailnet Sharing.

@@ -14,9 +14,35 @@
 #   export CLIENT_ID=<org-level OAuth client id>       # or put them in ../.env
 #   export CLIENT_SECRET=<org-level OAuth client secret>
 #   ./end-to-end.sh up       # provision, deploy, and share (needs CLIENT_ID/CLIENT_SECRET)
+#   ./end-to-end.sh up --direction one   # one-directional: only sandbox-b's
+#                             # tag can reach into sandbox-a (default is
+#                             # bidirectional: --direction bi)
+#   ./end-to-end.sh up --only sandboxes  # run just one step (or a few) instead
+#   ./end-to-end.sh up --only sharing,verify   # of the whole pipeline --
+#                             # comma-separated, or pass --only more than
+#                             # once; either way it's the same as passing
+#                             # both. Valid steps, in pipeline order:
+#                             #   sandboxes  provision the two tailnets      (01)
+#                             #   app        enable HTTPS, tag the policy,
+#                             #              issue an auth key, deploy tsnet (02)
+#                             #   sharing    apply the declarative sharing
+#                             #              policy between the two sandboxes(03)
+#                             #   verify     probe cross-tailnet connectivity
+#                             # Steps after 'sandboxes' assume earlier steps
+#                             # already ran (state is read from .state/).
+#
+#   SANDBOX_A_CLIENT_ID=... SANDBOX_A_CLIENT_SECRET=... SANDBOX_A_TAILNET_ID=... \
+#   ./end-to-end.sh up --only sharing to run a tailnet override
 #   ./end-to-end.sh status   # show what's running
+#   ./end-to-end.sh policy   # dump each sandbox tailnet's current policy file
+#                             # (uses the per-tailnet credentials saved under
+#                             # .state/, not CLIENT_ID/CLIENT_SECRET)
 #   ./end-to-end.sh down     # tear everything back down (uses the per-tailnet
-#                             # credentials saved under .state/, not CLIENT_ID/CLIENT_SECRET)
+#                             # credentials saved under .state/, not CLIENT_ID/CLIENT_SECRET).
+#                             # An overridden label is never deleted or
+#                             # modified -- 'down' instead prints what to
+#                             # clean up by hand in its real policy/device
+#                             # list (only the pieces still actually there).
 #
 # Requires: curl, jq, docker
 
@@ -27,9 +53,21 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 STATE_DIR="$SCRIPT_DIR/.state"
 APP_IMAGE="ts-demo-app"
 DOMAIN="https://api.tailscale.com"
+APP_TAG="tag:tsnet-app"
+APP_TAG_NAME="${APP_TAG#tag:}"
 
 # Two isolated tailnets get created and torn down by this script.
 LABELS=(a b)
+
+# bi: both sandboxes can reach each other. one: only sandbox-b can reach
+# sandbox-a (sandbox-a shares its app; sandbox-b never shares anything back).
+DIRECTION="bi"
+
+# Pipeline steps, in order. --only restricts `up` to just these (comma-
+# separated, e.g. --only sharing,verify, or pass --only more than once);
+# empty means "run them all" (the default, full end-to-end pipeline).
+STEPS=(sandboxes app sharing verify)
+ONLY_STEPS=()
 
 log()  { printf '\033[1;34m[e2e]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m[e2e]\033[0m %s\n' "$*" >&2; }
@@ -37,25 +75,68 @@ die()  { printf '\033[1;31m[e2e]\033[0m %s\n' "$*" >&2; exit 1; }
 
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
+parse_up_args() {
+  local value step ok
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --direction)   DIRECTION="${2:-}"; shift 2 ;;
+      --direction=*) DIRECTION="${1#*=}"; shift ;;
+      --only)        value="${2:-}"; shift 2 ;;
+      --only=*)      value="${1#*=}"; shift ;;
+      *) die "unknown argument to 'up': $1" ;;
+    esac
+    if [[ -n "${value:-}" ]]; then
+      local IFS=,; local -a parts=($value); unset IFS
+      ONLY_STEPS+=("${parts[@]}")
+      value=""
+    fi
+  done
+  case "$DIRECTION" in
+    bi|one) ;;
+    *) die "--direction must be 'bi' or 'one' (got '$DIRECTION')" ;;
+  esac
+  for step in "${ONLY_STEPS[@]}"; do
+    ok=false
+    for s in "${STEPS[@]}"; do [[ "$s" == "$step" ]] && ok=true; done
+    "$ok" || die "--only must be one or more of: ${STEPS[*]} (got '$step')"
+  done
+}
+
+# should_run STEP -> true if this step should execute given --only (or if
+# no --only was passed, in which case every step runs).
+should_run() {
+  [[ "${#ONLY_STEPS[@]}" -eq 0 ]] && return 0
+  local step
+  for step in "${ONLY_STEPS[@]}"; do [[ "$step" == "$1" ]] && return 0; done
+  return 1
+}
+
+# For 'one', sandbox-a is always the sharer (exposes its own app) and
+# sandbox-b is always the receiver (its tag gets referenced, no grant back).
+sharing_role_for() {
+  local label="$1"
+  if [[ "$DIRECTION" == "bi" ]]; then
+    echo "both"
+  elif [[ "$label" == "a" ]]; then
+    echo "share"
+  else
+    echo "receive"
+  fi
+}
+
 load_env() {
-  [[ -f "$ROOT_DIR/.env" ]] && { set -a; source "$ROOT_DIR/.env"; set +a; }
+  # A missing .env isn't itself an error -- callers may rely on exported
+  # env vars instead, or need no credentials at all (e.g. an all-override
+  # run). require_env below is what turns "still unset" into a die.
+  if [[ -f "$ROOT_DIR/.env" ]]; then
+    set -a; source "$ROOT_DIR/.env"; set +a
+  fi
 }
 
 require_env() {
   load_env
   [[ -n "${CLIENT_ID:-}" && -n "${CLIENT_SECRET:-}" ]] \
     || die "CLIENT_ID/CLIENT_SECRET not set (export them, or fill in $ROOT_DIR/.env — see .env.example)"
-}
-
-# --- Step 0: org-level access token -----------------------------------
-# Same exchange as ../01-tailnet-sandboxes/readme.md. This token is only
-# used to create/delete the two sandbox tailnets below; every other call
-# uses the scoped token handed back for that specific tailnet.
-org_access_token() {
-  curl -sS -X POST "$DOMAIN/api/v2/oauth/token" \
-    -d "client_id=$CLIENT_ID" \
-    -d "client_secret=$CLIENT_SECRET" \
-    | jq -r '.access_token'
 }
 
 # --- Step 1: provision two isolated tailnets ---------------------------
@@ -83,9 +164,40 @@ tailnet_access_token() {
 # membership/main.go calls srv.ListenTLS — without this, that call fails
 # at runtime with "you must enable HTTPS in the admin panel to proceed".
 # There's no dedicated toggle endpoint in the public API docs, but the
-# tailnet settings resource accepts a PATCH for it.
-enable_https() {
+# tailnet settings resource is a normal GET/PATCH pair, same shape as the
+# ACL endpoint.
+get_settings() {
   local token="$1"
+  curl -sS "$DOMAIN/api/v2/tailnet/-/settings" \
+    --header "Authorization: Bearer $token"
+}
+
+# enable_https TOKEN LABEL -> turns HTTPS on
+enable_https() {
+  local token="$1" label="$2" enabled
+  enabled=$(get_settings "$token" | jq -r '.httpsEnabled')
+  # Only act on an explicit "false"
+  if [[ "$enabled" != "false" ]]; then
+    log "HTTPS certs already enabled (or not applicable) for sandbox-$label"
+    return 0
+  fi
+
+  if sandbox_overridden "$label"; then
+    warn "sandbox-$label is configured via SANDBOX_${label^^}_* overrides — not enabling HTTPS via the API. Enable it yourself (admin console -> DNS -> HTTPS Certificates, or PATCH $DOMAIN/api/v2/tailnet/-/settings with {\"httpsEnabled\": true}) if you want it live -- 02-tailnet-membership's tsnet app needs it to start:"
+    if [[ -t 0 ]]; then
+      local current
+      while true; do
+        read -r -p "$(printf '\033[1;34m[e2e]\033[0m press Enter once applied to sandbox-%s (or Ctrl-C to stop) ' "$label")" _
+        current=$(get_settings "$token" | jq -r '.httpsEnabled')
+        [[ "$current" == "true" ]] && { log "sandbox-$label: HTTPS confirmed enabled"; break; }
+        warn "sandbox-$label: still doesn't show as enabled — apply it, then press Enter again"
+      done
+    else
+      die "sandbox-$label needs HTTPS enabled before continuing, and stdin isn't a terminal to confirm it -- enable it, then run interactively, or re-run once it's on (already-on is a no-op and skips this prompt)"
+    fi
+    return 0
+  fi
+
   curl -sS "$DOMAIN/api/v2/tailnet/-/settings" \
     --request PATCH \
     --header 'Content-Type: application/json' \
@@ -111,60 +223,152 @@ get_policy() {
     --header 'Accept: application/json'
 }
 
+# Update the policy via APIs
 put_policy() {
-  local token="$1" policy="$2"
+  local token="$1" label="$2" old="$3" new="$4" message="$5" check_filter="$6"
+  if sandbox_overridden "$label"; then
+    if [[ "$old" == "$new" ]]; then
+      log "sandbox-$label policy already matches, nothing to change"
+      return 0
+    fi
+    warn "sandbox-$label is configured via SANDBOX_${label^^}_* overrides — not applying this policy change via the API. Apply it yourself (e.g. via the admin console's ACL editor) if you want it live:"
+    printf '%s\n' "$message" >&2
+    # get the authkey
+    if [[ -t 0 ]]; then
+      local current
+      while true; do
+        read -r -p "$(printf '\033[1;34m[e2e]\033[0m press Enter once applied to sandbox-%s (or Ctrl-C to stop) ' "$label")" _
+        current=$(get_policy "$token")
+        if jq -e "$check_filter" <<<"$current" >/dev/null 2>&1; then
+          log "sandbox-$label: confirmed applied"
+          break
+        fi
+        warn "sandbox-$label: doesn't look applied yet (the change above is still missing) — apply it, then press Enter again"
+      done
+    else
+      die "sandbox-$label needs the above applied before continuing, and stdin isn't a terminal to confirm it -- apply it, then run interactively, or re-run once it's live (matching policy is a no-op and skips this prompt)"
+    fi
+    return 0
+  fi
   curl -sS "$DOMAIN/api/v2/tailnet/-/acl" \
     --request POST \
     --header 'Content-Type: application/json' \
     --header "Authorization: Bearer $token" \
-    --data "$policy" --fail-with-body -o /dev/null
+    --data "$new" --fail-with-body -o /dev/null
 }
 
 patch_policy_tag() {
-  local token="$1" new
-  new=$(jq '.tagOwners["tag:tsnet-app"] = (.tagOwners["tag:tsnet-app"] // ["autogroup:admin"])' \
-    <<<"$(get_policy "$token")")
-  put_policy "$token" "$new"
+  local token="$1" label="$2" old new tag_value wrapped message check_filter
+  old=$(get_policy "$token")
+  new=$(jq --arg tag "$APP_TAG" '.tagOwners[$tag] = (.tagOwners[$tag] // ["autogroup:admin"])' <<<"$old")
+  tag_value=$(jq -c --arg tag "$APP_TAG" '.tagOwners[$tag]' <<<"$new")
+  wrapped=$(jq -n --argjson v "$tag_value" --arg tag "$APP_TAG" '{tagOwners: {($tag): $v}}')
+  message=$(printf 'Merge the "tagOwners" key below into your policy (merge into your existing tagOwners object, don'"'"'t replace it):\n%s' "$wrapped")
+  check_filter=".tagOwners[\"$APP_TAG\"] == $tag_value"
+  put_policy "$token" "$label" "$old" "$new" "$message" "$check_filter"
 }
 
 patch_policy_sharing() {
-  local token="$1" other_id="$2" other_label="$3"
-  local new
+  local token="$1" label="$2" other_id="$3" other_label="$4" role="$5"
+  local old new external_entry grant message
+  # role "share":   accept incoming connections + write the grant that
+  #                 exposes our own tag to the referenced external group.
+  # role "receive": only let the external tailnet reference our tag —
+  #                 no grant, we're not exposing anything of our own.
+  # role "both":    do both (bidirectional sharing). Declarative sharing is
+  #                 like routing, it needs to be mutually agreed upon.
+  old=$(get_policy "$token")
   new=$(jq \
-    --arg tag "tag:tsnet-app" \
+    --arg tag "$APP_TAG" \
+    --arg tagname "$APP_TAG_NAME" \
     --arg name "sandbox-$other_label" \
     --arg id "$other_id" \
-    '.externalTailnets[$name] = {"externalID": $id, "allowExternalReferencesTo": [$tag]}
-     | .grants = ((.grants // []) + [{"src": ["group://\($name)/all"], "dst": [$tag], "ip": ["*"]}])' \
-    <<<"$(get_policy "$token")")
+    --arg role "$role" \
+    '.externalTailnets[$name] =
+        ( {"externalID": $id}
+          + (if ($role == "share" or $role == "both") then {"allowIncomingConnections": true} else {} end)
+          + (if ($role == "receive" or $role == "both") then {"allowExternalReferencesTo": [$tag]} else {} end)
+        )
+     | (if ($role == "share" or $role == "both") then
+         .grants = ((.grants // []) + [{"src": ["tag://\($name)/\($tagname)"], "dst": [$tag], "ip": ["*"]}])
+       else . end)' \
+    <<<"$old")
 
-  put_policy "$token" "$new" \
-    && log "policy updated for sandbox-$other_label sharing" \
-    || warn "policy update failed (likely not on the Declarative Sharing waitlist) — continuing without cross-tailnet sharing"
+  local wrapped external_value old_external_value check_filter
+  external_value=$(jq -c -n \
+    --arg tag "$APP_TAG" --arg role "$role" --arg id "$other_id" \
+    '{"externalID": $id}
+     + (if ($role == "share" or $role == "both") then {"allowIncomingConnections": true} else {} end)
+     + (if ($role == "receive" or $role == "both") then {"allowExternalReferencesTo": [$tag]} else {} end)')
+  wrapped=$(jq -n --argjson v "$external_value" --arg name "sandbox-$other_label" '{externalTailnets: {($name): $v}}')
+  old_external_value=$(jq --arg name "sandbox-$other_label" '.externalTailnets[$name] // null' <<<"$old")
+
+  if [[ "$old_external_value" == "null" ]]; then
+    message=$(printf 'Merge the "externalTailnets" key below into your policy (merge into your existing externalTailnets object, don'"'"'t replace it):\n%s' "$wrapped")
+  else
+    local diff_out
+    diff_out=$(diff <(jq -S . <<<"$old_external_value") <(jq -S -c -n --argjson v "$external_value" '$v' | jq -S .) 2>/dev/null || true)
+    message=$(printf 'The existing "sandbox-%s" entry under "externalTailnets" needs to change (- = remove this line, + = add it):\n%s\n\nReplace that entire entry with this (don'"'"'t just merge -- some keys need to go away):\n%s' \
+      "$other_label" "$diff_out" "$wrapped")
+  fi
+  check_filter=".externalTailnets[\"sandbox-$other_label\"] == $external_value"
+
+  if [[ "$role" == "share" || "$role" == "both" ]]; then
+    grant=$(jq -n --arg tag "$APP_TAG" --arg tagname "$APP_TAG_NAME" --arg name "sandbox-$other_label" \
+      '{"src": ["tag://\($name)/\($tagname)"], "dst": [$tag], "ip": ["*"]}')
+    message="$message"$'\n\n'"Append this object to the top-level \"grants\" array (don't replace the array, add to it):"$'\n'"$grant"
+    local grant_value; grant_value=$(jq -c . <<<"$grant")
+    check_filter="$check_filter and ([.grants[]? | select(. == $grant_value)] | length > 0)"
+  fi
+
+  if sandbox_overridden "$label"; then
+    put_policy "$token" "$label" "$old" "$new" "$message" "$check_filter"
+    return
+  fi
+
+  if put_policy "$token" "$label" "$old" "$new" "$message" "$check_filter"; then
+    log "policy updated for sandbox-$other_label sharing (role: $role)"
+  elif [[ "$role" == "both" ]]; then
+    # allowIncomingConnections is allowed even if declarative node sharing
+    # is not enabled on the account.
+    warn "policy update failed for role 'both' (likely sandbox-$label's org isn't on the Declarative Sharing waitlist for allowIncomingConnections) — retrying with just the 'receive' half, which doesn't need that access"
+    patch_policy_sharing "$token" "$label" "$other_id" "$other_label" "receive"
+  else
+    warn "policy update failed (likely not on the Declarative Sharing waitlist) — continuing without cross-tailnet sharing"
+  fi
 }
 
 # --- Step 3: issue a scoped auth key ------------------------------------
 # See ../04-api-is-the-way/readme.md, "Issuing auth keys instead of
 # copy-pasting them" for what each field below does.
-issue_auth_key() {
-  local token="$1"
+# issue_scoped_key TOKEN EXPIRY_SECONDS -> a reusable=false, ephemeral,
+# preauthorized key tagged $APP_TAG. Shared by issue_auth_key (the
+# long-lived app key) and verify_connectivity (a short-lived probe key) --
+# same capabilities, different expiry.
+issue_scoped_key() {
+  local token="$1" expiry="$2"
   curl -sS "$DOMAIN/api/v2/tailnet/-/keys" \
     --request POST \
     --header 'Content-Type: application/json' \
     --header "Authorization: Bearer $token" \
-    --data '{
-      "capabilities": {
-        "devices": {
-          "create": {
-            "reusable": false,
-            "ephemeral": true,
-            "preauthorized": true,
-            "tags": ["tag:tsnet-app"]
+    --data "{
+      \"capabilities\": {
+        \"devices\": {
+          \"create\": {
+            \"reusable\": false,
+            \"ephemeral\": true,
+            \"preauthorized\": true,
+            \"tags\": [\"$APP_TAG\"]
           }
         }
       },
-      "expirySeconds": 3600
-    }' | jq -r '.key'
+      \"expirySeconds\": $expiry
+    }" | jq -r '.key'
+}
+
+issue_auth_key() {
+  local token="$1"
+  issue_scoped_key "$token" 3600
 }
 
 # --- Step 4: deploy the tsnet app ---------------------------------------
@@ -172,8 +376,44 @@ issue_auth_key() {
 # dockerfile, given an auth key instead of a dashboard-issued one. It
 # serves "Hello from tsnet" directly over HTTPS on the tailnet — no
 # backend to stand up.
+device_ids_by_hostname() {
+  local token="$1" hostname="$2"
+  curl -sS "$DOMAIN/api/v2/tailnet/-/devices" \
+      --header "Authorization: Bearer $token" \
+    | jq -r --arg h "$hostname" '.devices[] | select(.hostname == $h) | .id'
+}
+# This part solves the problem where a device is deleted but its still listed in the Tailnet.
+delete_device() {
+  local token="$1" id="$2"
+  curl -sS "$DOMAIN/api/v2/device/$id" --request DELETE --header "Authorization: Bearer $token" -o /dev/null
+}
+
 deploy_app() {
-  local label="$1" authkey="$2"
+  local label="$1" authkey="$2" token="$3"
+  local hostname="sandbox-$label-app" device_ids reply
+
+  device_ids=$(device_ids_by_hostname "$token" "$hostname")
+
+  # Only ask when there's actually something from a previous run to tear
+  # down -- a clean first deploy shouldn't need confirmation.
+  if docker inspect "ts-demo-app-$label" >/dev/null 2>&1 || [[ -n "$device_ids" ]]; then
+    warn "$hostname already exists from a previous run (docker container and/or tailnet device)."
+    if [[ -t 0 ]]; then
+      read -r -p "$(printf '\033[1;34m[e2e]\033[0m remove it and redeploy? [y/N] ')" reply
+      [[ "$reply" =~ ^[Yy] ]] || die "aborted: leaving $hostname in place, not redeployed"
+    else
+      die "$hostname already exists and stdin isn't a terminal to confirm removal -- run '$0 up' interactively, or remove it yourself first"
+    fi
+    docker rm -f "ts-demo-app-$label" >/dev/null 2>&1 || true
+  fi
+
+
+
+  # Free the hostname on the Tailscale side
+  local id
+  for id in $device_ids; do
+    delete_device "$token" "$id"
+  done
 
   docker run -d --name "ts-demo-app-$label" \
     -e "TS_HOSTNAME=sandbox-$label-app" \
@@ -181,27 +421,156 @@ deploy_app() {
     "$APP_IMAGE" >/dev/null
 }
 
-cmd_up() {
-  require_env
-  require_cmd curl; require_cmd jq; require_cmd docker
+# --- Step 5: verify the sharing grant is actually reachable -------------
+# This part runs two probe to check the actual flow of traffic.
+PROBE_IMAGE="tailscale/tailscale"
+
+# To override and sharing DNSname of the Tailnet is important.
+sandbox_field() {
+  local label="$1" field="$2" varname value f
+  varname="SANDBOX_${label^^}_${field^^}"
+  value="${!varname:-}"
+  if [[ -n "$value" ]]; then
+    echo "$value"
+    return
+  fi
+  f="$STATE_DIR/tailnet-$label.json"
+  [[ -f "$f" ]] || die "no tailnet state for sandbox-$label yet, and $varname is not set — run '$0 up --only sandboxes' first, or set $varname"
+  case "$field" in
+    client_id)     jq -r '.oauthClient.id' "$f" ;;
+    client_secret) jq -r '.oauthClient.secret' "$f" ;;
+    tailnet_id)    jq -r '.id' "$f" ;;
+    dns_name)      jq -r '.dnsName' "$f" ;;
+    *) die "sandbox_field: unknown field '$field'" ;;
+  esac
+}
+
+sandbox_token() {
+  local label="$1"
+  tailnet_access_token "$(sandbox_field "$label" client_id)" "$(sandbox_field "$label" client_secret)"
+}
+
+verify_connectivity() {
+  local from_label="$1" from_token="$2" to_host="$3" probe_key
+
+  probe_key=$(issue_scoped_key "$from_token" 300)
+  [[ -n "$probe_key" && "$probe_key" != "null" ]] \
+    || { warn "could not issue probe key for sandbox-$from_label — skipping connectivity check"; return 1; }
+
+  log "probing sandbox-$from_label -> $to_host (joins a short-lived probe device, ~10-30s)"
+  # A simple pass/fail here isn't enough to tell what is the issue,
+  # a real ACL denial apart from "tailscale up" never completing, DNS not
+  # resolving the cross-tailnet MagicDNS name, or the shared peer just not
+  # having propagated into this probe's netmap yet. The nc retry loop
+  # covers that last case (netmap propagation lagging a few seconds behind
+  # "tailscale up" returning); everything else prints straight to stderr.
+  if docker run --rm \
+      -e TS_AUTHKEY="$probe_key" \
+      -e TO_HOST="$to_host" \
+      "$PROBE_IMAGE" \
+      sh -c '
+        tailscaled --tun=userspace-networking --state=mem: --socket=/tmp/ts.sock >/tmp/tailscaled.log 2>&1 &
+        up=1
+        for i in $(seq 1 30); do
+          tailscale --socket=/tmp/ts.sock up --authkey="$TS_AUTHKEY" --hostname="probe-$$" 2>/tmp/up.log && { up=0; break; }
+          sleep 1
+        done
+        if [ "$up" -ne 0 ]; then
+          echo "[probe] tailscale up never succeeded:" >&2
+          cat /tmp/up.log >&2
+          echo "[probe] tailscaled log:" >&2
+          cat /tmp/tailscaled.log >&2
+          exit 1
+        fi
+        echo "[probe] joined tailnet, connecting to $TO_HOST:443" >&2
+        ok=1
+        for i in $(seq 1 10); do
+          if tailscale --socket=/tmp/ts.sock nc "$TO_HOST" 443 </dev/null 2>/tmp/nc.log; then
+            ok=0; break
+          fi
+          sleep 2
+        done
+        if [ "$ok" -ne 0 ]; then
+          echo "[probe] tailscale nc failed after retries:" >&2
+          cat /tmp/nc.log >&2
+          echo "[probe] tailscale status:" >&2
+          tailscale --socket=/tmp/ts.sock status >&2
+          exit 1
+        fi
+      '
+  then
+    log "connectivity OK: sandbox-$from_label can reach $to_host"
+  else
+    warn "connectivity check FAILED: sandbox-$from_label could not reach $to_host over the tailnet (see [probe] output above)"
+  fi
+}
+
+# Override the sandbox
+sandbox_overridden() {
+  local label="$1" varname="SANDBOX_${1^^}_CLIENT_ID"
+  [[ -n "${!varname:-}" ]]
+}
+
+sandbox_known() {
+  local label="$1"
+  sandbox_overridden "$label" && return 0
+  [[ -f "$STATE_DIR/tailnet-$label.json" ]]
+}
+
+# If the user is doing an override we are not going to delete anything from their account
+# instead we are prompting them about the next steps to cleanup their accounts.
+describe_override_cleanup() {
+  local label="$1" other role token policy has_tag has_external has_grant
+  other=$([[ "$label" == "a" ]] && echo b || echo a)
+  role=$(sharing_role_for "$label")
+
+  warn "sandbox-$label is configured via SANDBOX_${label^^}_* overrides — 'down' won't delete or modify it. Manual cleanup if you want it back to how it was:"
+
+  token=$(sandbox_token "$label" 2>/dev/null) || token=""
+  if [[ -n "$token" && "$token" != "null" ]]; then
+    policy=$(get_policy "$token")
+    has_tag=$(jq -r --arg tag "$APP_TAG" '.tagOwners[$tag] // empty' <<<"$policy")
+    has_external=$(jq -r --arg n "sandbox-$other" '.externalTailnets[$n] // empty' <<<"$policy")
+    has_grant=$(jq --arg src "tag://sandbox-$other/$APP_TAG_NAME" '[.grants[]? | select(.src == [$src])] | length' <<<"$policy")
+
+    [[ -n "$has_tag" ]] && warn "  - remove \"$APP_TAG\" from tagOwners (if you don't need it for anything else)"
+    [[ -n "$has_external" ]] && warn "  - remove the \"sandbox-$other\" entry from externalTailnets"
+    [[ "${has_grant:-0}" -gt 0 ]] && warn "  - remove the grants entry with src [\"tag://sandbox-$other/$APP_TAG_NAME\"]"
+    if [[ -z "$has_tag" && -z "$has_external" && "${has_grant:-0}" -eq 0 ]]; then
+      warn "  - nothing to undo in its policy (looks like the printed changes were never applied)"
+    fi
+  else
+    warn "  - (couldn't read its live policy to check what's still there — if you applied the tag/sharing changes shown earlier, remove \"$APP_TAG\" from tagOwners, the \"sandbox-$other\" entry from externalTailnets, and the matching grants entry)"
+  fi
+  warn "  - check its device list for a leftover \"sandbox-$label-app\" node from the demo deployment: https://login.tailscale.com/admin/machines"
+}
+
+step_sandboxes() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
 
-  log "requesting org access token"
-  local org_token; org_token=$(org_access_token)
-  [[ "$org_token" != "null" && -n "$org_token" ]] || die "failed to get org access token — check CLIENT_ID/CLIENT_SECRET"
-
-  log "building tsnet app image from ../02-tailnet-membership"
-  docker build -q -f "$ROOT_DIR/02-tailnet-membership/dockerfile" -t "$APP_IMAGE" "$ROOT_DIR/02-tailnet-membership" >/dev/null
-
+  local label to_create=()
   for label in "${LABELS[@]}"; do
+    if sandbox_overridden "$label"; then
+      log "sandbox-$label is configured via SANDBOX_${label^^}_* overrides, skipping provisioning"
+      continue
+    fi
     local f="$STATE_DIR/tailnet-$label.json"
-
-    # There is a secret let's reuse it
     if [[ -f "$f" ]] && jq -e '.oauthClient.secret' "$f" >/dev/null 2>&1; then
       log "reusing existing tailnet state for e2e-sandbox-$label"
       continue
     fi
+    to_create+=("$label")
+  done
+  [[ "${#to_create[@]}" -eq 0 ]] && return
+
+  require_env
+  log "requesting org access token"
+  local org_token; org_token=$(tailnet_access_token "$CLIENT_ID" "$CLIENT_SECRET")
+  [[ "$org_token" != "null" && -n "$org_token" ]] || die "failed to get org access token — check CLIENT_ID/CLIENT_SECRET"
+
+  for label in "${to_create[@]}"; do
+    local f="$STATE_DIR/tailnet-$label.json"
 
     # Don't write down keys if its an error
     log "creating tailnet e2e-sandbox-$label"
@@ -215,51 +584,122 @@ cmd_up() {
       die "tailnet creation failed for e2e-sandbox-$label: $msg"
     fi
   done
+}
 
+step_app() {
+  require_cmd docker
+  log "building tsnet app image from ../02-tailnet-membership"
+  docker build -q -f "$ROOT_DIR/02-tailnet-membership/dockerfile" -t "$APP_IMAGE" "$ROOT_DIR/02-tailnet-membership" >/dev/null
+
+  local label
   for label in "${LABELS[@]}"; do
-    local other; other=$([[ "$label" == "a" ]] && echo b || echo a)
-    local cid csecret token authkey
-
-    cid=$(jq -r '.oauthClient.id' "$STATE_DIR/tailnet-$label.json")
-    csecret=$(jq -r '.oauthClient.secret' "$STATE_DIR/tailnet-$label.json")
-    token=$(tailnet_access_token "$cid" "$csecret")
+    local token authkey
+    token=$(sandbox_token "$label")
 
     log "enabling HTTPS certs for sandbox-$label"
-    enable_https "$token" || die "failed to enable HTTPS certs for sandbox-$label"
+    enable_https "$token" "$label" || die "failed to enable HTTPS certs for sandbox-$label"
 
-    log "declaring tag:tsnet-app for sandbox-$label"
-    patch_policy_tag "$token" || die "failed to update policy tags for sandbox-$label"
-
-    other_id=$(jq -r '.id' "$STATE_DIR/tailnet-$other.json")
-    log "updating policy for sandbox-$label -> sandbox-$other sharing"
-    patch_policy_sharing "$token" "$other_id" "$other"
+    log "declaring $APP_TAG for sandbox-$label"
+    patch_policy_tag "$token" "$label" || die "failed to update policy tags for sandbox-$label"
 
     log "issuing tsnet auth key for sandbox-$label"
     authkey=$(issue_auth_key "$token")
     [[ -n "$authkey" && "$authkey" != "null" ]] || die "failed to issue auth key for sandbox-$label"
 
     log "deploying app for sandbox-$label"
-    deploy_app "$label" "$authkey"
+    deploy_app "$label" "$authkey" "$token"
   done
+}
 
-  log "done. run '$0 status' to see the two apps."
+step_sharing() {
+  local label
+  for label in "${LABELS[@]}"; do
+    local other; other=$([[ "$label" == "a" ]] && echo b || echo a)
+    local token other_id
+    token=$(sandbox_token "$label")
+    other_id=$(sandbox_field "$other" tailnet_id)
+    local role; role=$(sharing_role_for "$label")
+    log "updating policy for sandbox-$label -> sandbox-$other sharing (role: $role, direction: $DIRECTION)"
+    patch_policy_sharing "$token" "$label" "$other_id" "$other" "$role"
+  done
+}
+
+step_verify() {
+  require_cmd docker
+  log "verifying cross-tailnet connectivity (direction: $DIRECTION)"
+  local dns_a dns_b token_a token_b
+  dns_a=$(sandbox_field a dns_name)
+  dns_b=$(sandbox_field b dns_name)
+  token_a=$(sandbox_token a)
+  token_b=$(sandbox_token b)
+  if [[ "$DIRECTION" == "bi" ]]; then
+    verify_connectivity a "$token_a" "sandbox-b-app.$dns_b"
+  else
+    log "one-directional sharing: sandbox-a shares but doesn't receive access, skipping sandbox-a -> sandbox-b probe"
+  fi
+  verify_connectivity b "$token_b" "sandbox-a-app.$dns_a"
+}
+
+cmd_up() {
+  require_cmd curl; require_cmd jq
+  load_env
+
+  should_run sandboxes && step_sandboxes
+  should_run app       && step_app
+  should_run sharing   && step_sharing
+  should_run verify    && step_verify
+
+  if [[ "${#ONLY_STEPS[@]}" -gt 0 ]]; then
+    log "done running step(s): $(IFS=,; echo "${ONLY_STEPS[*]}")."
+  else
+    log "done. run '$0 status' to see the two apps."
+  fi
 }
 
 cmd_status() {
-  [[ -d "$STATE_DIR" ]] || die "nothing is up (no $STATE_DIR) — run '$0 up' first"
+  load_env
+  local label shown=false
   for label in "${LABELS[@]}"; do
-    local f="$STATE_DIR/tailnet-$label.json"
-    [[ -f "$f" ]] || continue
-    local dns; dns=$(jq -r '.dnsName' "$f")
+    sandbox_known "$label" || continue
+    local dns
+    dns=$(sandbox_field "$label" dns_name) \
+      || { warn "sandbox-$label: couldn't resolve its DNS name — skipping"; continue; }
     echo "sandbox-$label:  https://sandbox-$label-app.$dns"
+    shown=true
   done
+  [[ "$shown" == true ]] || die "nothing is up (no $STATE_DIR, and no SANDBOX_*_CLIENT_ID overrides) — run '$0 up' first"
   echo
   docker ps --filter "name=ts-demo-" --format 'table {{.Names}}\t{{.Status}}'
 }
 
+cmd_policy() {
+  require_cmd curl; require_cmd jq
+  load_env
+  local label dumped=false
+  for label in "${LABELS[@]}"; do
+    sandbox_known "$label" || continue
+
+    local token
+    token=$(sandbox_token "$label") \
+      || { warn "could not resolve credentials for sandbox-$label — skipping"; continue; }
+    if [[ "$token" == "null" || -z "$token" ]]; then
+      warn "could not get an access token for sandbox-$label — skipping"
+      continue
+    fi
+
+    log "policy for sandbox-$label:"
+    get_policy "$token" | jq .
+    echo
+    dumped=true
+  done
+  [[ "$dumped" == true ]] || die "no sandbox tailnet configured (no $STATE_DIR, and no SANDBOX_*_CLIENT_ID overrides)"
+}
+
 cmd_down() {
   require_cmd curl; require_cmd jq; require_cmd docker
+  load_env
 
+  local label
   # Docker resources never need a Tailscale credential to remove, so this
   # always runs even if CLIENT_ID/CLIENT_SECRET are missing or rotated.
   for label in "${LABELS[@]}"; do
@@ -267,6 +707,11 @@ cmd_down() {
   done
   docker rmi "$APP_IMAGE" >/dev/null 2>&1 || true
   log "docker resources removed"
+
+  # Override never should delete the items.
+  for label in "${LABELS[@]}"; do
+    sandbox_overridden "$label" && describe_override_cleanup "$label"
+  done
 
   if [[ -d "$STATE_DIR" ]]; then
     # Deletion requires a token scoped to the specific tailnet being
@@ -277,6 +722,7 @@ cmd_down() {
     # everything it needs is already sitting in $STATE_DIR.
     local all_deleted=true
     for label in "${LABELS[@]}"; do
+      sandbox_overridden "$label" && continue
       local f="$STATE_DIR/tailnet-$label.json"
       [[ -f "$f" ]] || continue
 
@@ -305,8 +751,13 @@ cmd_down() {
 }
 
 case "${1:-}" in
-  up)     cmd_up ;;
+  up)
+    shift
+    parse_up_args "$@"
+    cmd_up
+    ;;
   status) cmd_status ;;
+  policy) cmd_policy ;;
   down)   cmd_down ;;
-  *) die "usage: $0 {up|status|down}" ;;
+  *) die "usage: $0 {up [--direction bi|one] [--only $(IFS='|'; echo "${STEPS[*]}")]|status|policy|down}" ;;
 esac
